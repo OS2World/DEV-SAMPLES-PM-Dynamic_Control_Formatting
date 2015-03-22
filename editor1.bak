@@ -1,0 +1,675 @@
+//---------------------------------------------------------------------------------------------
+// File TOOLBAR.CPP
+//---------------------------------------------------------------------------------------------
+// HISTORY:
+// Original by Eric Slatts EDM/2 Sample
+// Docking Control support by Alger Pike acp107@psu.edu
+ 
+#define INCL_WIN
+
+#include <os2.h>
+#include <stdio.h>
+#include <string.h>
+#include "editor1.h"
+
+//Window parms need by doc state and floatFrameProc
+typedef struct windowstruct
+{
+	PFNWP oldFrameProc;
+	HWND* mainFrame;
+	BOOL* dockState;
+	BOOL  isMenu;
+	USHORT menuItem;
+	HWND control;
+	HWND menu;
+	ULONG item;
+}	WinParms;
+
+
+ // Window procedure
+MRESULT EXPENTRY ClientWndProc (HWND,ULONG,MPARAM,MPARAM);
+
+// subclass framewindow
+MRESULT EXPENTRY NewFrameProc  (HWND, ULONG ,MPARAM, MPARAM);
+
+//subclass for floating frame window
+MRESULT EXPENTRY NewDocProc(HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2);
+
+//Client Window Proc for Floating client
+MRESULT EXPENTRY NewDocClientProc(HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2);
+
+//Function to dock undock view and minimize the desired control
+INT ToggleDockState(HWND mainFrame, HWND *floatFrame, HWND control, WinParms* controlParms, BOOL dockView);
+
+HAB   hab;
+
+HWND	hwndFrame,	hwndClient,	hwndStatus,	hwndToolbar,
+	hwndMenu,	hwndMLE,	hwndMenuDockFrame,
+	hwndStatusDockFrame;
+
+BOOL dockMenuState = 1;
+BOOL dockStatusState = 1;
+WinParms MenuParms;
+WinParms StatusParms;
+// Pointer to normal Frame routine in kernel for subclassing
+PFNWP pfnwOldFrameProc;
+
+//Pointer to floating Frame old Procs
+PFNWP pfnwOldMenuFrame;
+PFNWP pfnwOldStatusFrame;
+
+//Registered Classes
+CHAR  szClient[] = "CLIENT";
+CHAR  szFloatClient[] = "FLOATCLIENT";
+main()
+     {
+     HMQ   hmq;
+     QMSG  qmsg;
+     ULONG flFrameFlags = FCF_ICON | FCF_TITLEBAR |FCF_SYSMENU |FCF_SIZEBORDER |FCF_MINMAX |FCF_TASKLIST;
+
+     //Initialize the current dock State
+     MenuParms.dockState = &dockMenuState;
+     MenuParms.isMenu = TRUE;
+     StatusParms.dockState = &dockStatusState;
+     StatusParms.isMenu = FALSE;
+     hab = WinInitialize (0);
+     hmq = WinCreateMsgQueue (hab, 0);
+     WinRegisterClass (hab, szClient, ClientWndProc, CS_SIZEREDRAW, 0);
+     WinRegisterClass (hab, szFloatClient, NewDocClientProc, CS_SIZEREDRAW, sizeof(PVOID));
+
+     // Create Frame window
+     hwndFrame = WinCreateStdWindow (HWND_DESKTOP,
+				     WS_VISIBLE,
+				     &flFrameFlags,
+				     szClient,
+				     "MLE editor",
+				     0,
+				     NULLHANDLE,
+				     MAINMENU,
+				     &hwndClient);
+
+      // Create statusbar window
+      hwndStatus= WinCreateWindow(hwndFrame,
+				  WC_STATIC,
+				 " StatusBar",
+				  SS_TEXT| DT_VCENTER | WS_VISIBLE
+				  ,0, 0, 0, 0,       // client window has no size or position at this point
+				  hwndFrame,         // Owner handle (Client area)
+				  HWND_TOP,          // Z-order ontop
+				  STATUSBAR,         // Window ID
+				  0,                 // Control
+				  0);                // Presentation Parameters
+
+     hwndMLE = WinCreateWindow(hwndClient,           // Parent handle (Client area)
+			       WC_MLE,               // Window class (NLE)
+			       NULL,                 // Window header text
+			       WS_VISIBLE|
+			       MLS_WORDWRAP|
+			       MLS_BORDER|
+			       MLS_VSCROLL|
+			       MLS_HSCROLL,          //Style flags
+			       0, 0, 0, 0,           // client window has no size or position at this point
+			       hwndClient,           // Owner handle (Client area)
+			       HWND_TOP,             // Z-order ontop
+			       MAINMLE,              // Window ID (Main MLE resource ID)
+			       0,                    // Control
+			       0);                   // Presentation Parameters
+
+     //---------------------------------------------------------------------------------------------
+     // Subclassing normal window proc
+     //---------------------------------------------------------------------------------------------
+     pfnwOldFrameProc = WinSubclassWindow(hwndFrame,NewFrameProc);  // subclass Framewin
+     WinSetWindowULong(hwndFrame,QWL_USER,(ULONG)pfnwOldFrameProc); // Pointer to oldwinproc in winword
+
+     hwndToolbar = WinLoadMenu(hwndFrame,NULLHANDLE,TOOLBAR);       // Load Toolbar
+     hwndMenu    = WinLoadMenu(hwndFrame,NULLHANDLE,MAINMENU);      // Load normal window menu
+
+     //Set up Menu and item to be checked
+     //Doing it this way allows support for
+     //multiple menus
+     MenuParms.menu = hwndMenu;
+     MenuParms.item = IDM_VIEWMENU;
+     StatusParms.menu = hwndMenu;
+     StatusParms.item = IDM_VIEWSTATUS;
+
+     //If items are visible at startup check them
+     WinCheckMenuItem(MenuParms.menu,
+		      MenuParms.item,
+		      TRUE);
+     WinCheckMenuItem(StatusParms.menu,
+		      StatusParms.item,
+		      TRUE);
+
+     WinSetWindowPos(hwndFrame,
+		     NULLHANDLE,
+		     100,100,550,300,
+		     SWP_ACTIVATE|SWP_MOVE|
+		     SWP_SIZE    |SWP_SHOW);
+
+
+     WinStartTimer(hab, hwndClient, 1, 100);
+
+     while (WinGetMsg (hab, &qmsg, 0, 0, 0))
+	   WinDispatchMsg (hab, &qmsg);
+
+     WinDestroyWindow (hwndFrame);
+     WinDestroyMsgQueue (hmq);
+     WinTerminate (hab);
+     return(0);
+     }
+
+
+MRESULT EXPENTRY ClientWndProc (HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2)
+     {
+     switch (msg)
+	  {
+	  case WM_SIZE:
+	       {
+	       SWP   swpclient;
+	       WinQueryWindowPos(hwnd, &swpclient);            // Get SWP Client Area.
+	       WinSetWindowPos(hwndMLE,                        // Place and size MLE
+			       HWND_TOP,                       // ONTOP in Z-order
+			       0,                              // x coord(precies in de rand!)
+			       0,                              // y coord
+			       swpclient.cx,                   //
+			       swpclient.cy,                   // Size,Place (same as Client Area)
+			       SWP_SIZE | SWP_SHOW | SWP_MOVE);// Change size|move en Show
+	       }
+	  break;
+
+	  case WM_COMMAND:
+	       {
+	       switch (SHORT1FROMMP(mp1))
+		    {
+		    case IDM_NEW:
+			 WinSetWindowText(hwndMLE, "");
+		    break;
+
+		    case IDM_UNDO:
+			 WinSendMsg(hwndMLE, MLM_UNDO, 0L, 0L);
+		    break;
+
+		    case IDM_CUT:
+			 WinSendMsg(hwndMLE, MLM_CUT, 0L, 0L);
+		    break;
+
+		    case IDM_COPY:
+			 WinSendMsg(hwndMLE, MLM_COPY, 0L, 0L);
+		    break;
+
+		    case IDM_PASTE:
+			 WinSendMsg(hwndMLE, MLM_PASTE, 0L, 0L);
+		    break;
+
+		    case IDM_CLEAR:
+			 WinSendMsg(hwndMLE, MLM_CLEAR, 0L, 0L);
+		    break;
+
+		    case IDM_EXIT:
+			 WinSendMsg(hwnd, WM_CLOSE, 0L, 0L);
+		    break;
+
+		    case IDM_DOCKMENU:
+			{
+			ToggleDockState(hwndFrame, &hwndMenuDockFrame, hwndToolbar, &MenuParms, FALSE);
+			}
+		    break;
+
+		    case IDM_VIEWMENU:
+			{
+			 ToggleDockState(hwndFrame, &hwndMenuDockFrame, hwndToolbar, &MenuParms, TRUE);
+			}
+		    break;
+
+		    case IDM_DOCKSTATUS:
+			{
+			ToggleDockState(hwndFrame, &hwndStatusDockFrame, hwndStatus, &StatusParms, FALSE);
+			}
+		    break;
+
+		    case IDM_VIEWSTATUS:
+			{
+			 ToggleDockState(hwndFrame, &hwndStatusDockFrame, hwndStatus, &StatusParms, TRUE);
+			}
+		    break;
+		    case IDM_ABOUT:
+			 WinSetWindowText (hwndStatus, " MLE editor by Alger, Eric & Marc");
+			 WinDlgBox(HWND_DESKTOP, hwnd, WinDefDlgProc, NULLHANDLE, IDD_ABOUT, 0);
+		    break;
+
+		    }
+	       }
+
+	  case WM_TIMER:
+	       {
+	       CHAR      String[64];
+	       LONG      Line, Col, Position;
+	       static    LONG OldPosition;
+
+	       Position = LONGFROMMR(WinSendMsg(hwndMLE, MLM_QUERYSEL, (MPARAM)MLFQS_CURSORSEL,0L));
+	       if (Position != OldPosition)
+                    {
+                    OldPosition = Position;
+		    Line = LONGFROMMR(WinSendMsg(hwndMLE, MLM_LINEFROMCHAR, (MPARAM)Position, 0L));
+                    Col  = LONGFROMMR(WinSendMsg(hwndMLE, MLM_CHARFROMLINE, (MPARAM)Line, 0L));
+                    Col  = Position - Col;
+                    sprintf(String,"  Line: %-5d Col: %-5d",Line+1,Col+1);
+                    WinSetWindowText(hwndStatus, String);
+                    }
+               }
+
+          }
+     return (WinDefWindowProc (hwnd,msg,mp1,mp2));
+     }
+
+
+//-------------------------------------------------------------------------------------------------
+// NewFrameProc
+//
+// this proc is coupled through subclassing to the original window proc of the framewindow.
+// If the framewindow proc is called, for example if the framewindow is put on the screen,
+// this proc is called first. At the end of this subclass the handle  is passed to the
+// original proced.
+//-------------------------------------------------------------------------------------------------
+MRESULT EXPENTRY NewFrameProc(HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2)
+     {
+     PFNWP   oldFrameProc ;
+     oldFrameProc = (PFNWP) WinQueryWindowULong( hwnd, QWL_USER );      // Pointer from windowword
+
+     switch (msg)
+	  {
+	  case WM_QUERYFRAMECTLCOUNT:
+	       {
+	       USHORT   itemCount;
+
+		//get count of original frame
+		itemCount = SHORT1FROMMR(oldFrameProc(hwnd,msg,mp1,mp2));
+
+		//Old code below: When you dock controls you do not know
+		//ahead of time what the number to add is. You must calculate
+		//this on the fly based on whether or not the control is to
+		//be floated or docked
+		//return ( (MRESULT) (itemCount+2) );  //add 2 for new controls
+		if(MenuParms.dockState)
+			itemCount++;
+		if(StatusParms.dockState)
+			itemCount++;
+		return (MRESULT) itemCount;
+	       }
+
+	   case WM_FORMATFRAME :
+	       {
+	       USHORT itemCount = SHORT1FROMMR( oldFrameProc( hwnd, msg, mp1, mp2 ));
+	       USHORT usClient  = 0,
+		      usMenu    = 0;
+
+//These variables now become dynamic and cannot be set to a value
+//The new variable itemindex holds the running count of the number
+//of controls based on who is currently docked to the main frame.
+//		      usToolbar = itemCount,
+//		      usStatus  = itemCount+1;
+
+	       //These variables keep track of whose docked and what
+	       //their index is if they are
+	       USHORT items[ITEMS], maparray[ITEMS], i, itemindex;
+
+	       PSWP pSWP = (PSWP)PVOIDFROMMP(mp1);
+
+	       while (pSWP[usClient].hwnd != WinWindowFromID(hwnd, FID_CLIENT))
+		    ++usClient;
+	       while (pSWP[usMenu].hwnd != hwndMenu)
+		    ++usMenu;
+
+		//Arrays start from zero so this becomes the index of our first control
+		for(i=0; i<ITEMS; i++)
+			items[i] = itemCount + i;
+	       //Set our index to zero this is needed for docking control
+		itemindex = 0;
+	       // Fill in values for the Toolbar
+		if(dockMenuState)
+			{
+			maparray[0] = itemindex;
+			pSWP[items[maparray[0]]].fl = pSWP[usMenu].fl;        // SWP_SIZE style flag
+			pSWP[items[maparray[0]]].cy = pSWP[usClient].cy;      // Heigth menu hoogte
+			pSWP[items[maparray[0]]].cx = pSWP[usClient].cx ;     // width is menu width
+			pSWP[items[maparray[0]]].hwndInsertBehind = HWND_TOP ;// On which window (ONTOP)
+			pSWP[items[maparray[0]]].hwnd = hwndToolbar;          // Window handle
+
+			WinSendMsg(pSWP[items[maparray[0]]].hwnd,            // let the menu code make the adjustments(cy)
+				WM_ADJUSTWINDOWPOS,               // Message WM_ADJUSTWINDOWPOS to hwndTool
+				MPFROMP(pSWP+items[maparray[0]]),          // mp1 == SWP struct of hwndTool
+				(MPARAM) 0L );                    // mp2 == Leeg */
+
+			// position Toolbar at top framewindow
+			pSWP[items[maparray[0]]].x = pSWP[usMenu].x ;                      // XPOS in FRAME
+			pSWP[items[maparray[0]]].y = pSWP[usMenu].y - pSWP[items[maparray[0]]].cy ; // YPOS in FRAME
+
+			// adjust client window size for 2nd menu
+			// If not, the client window will be placed over the Toolbar
+			pSWP[usClient].cy= pSWP[usClient].cy - pSWP[items[maparray[0]]].cy ;
+
+			//If this item has been added increment the count
+			//Notice how the array index does NOT get incremented
+			//if this control is not docked. This is a key point.
+			itemindex++;
+			}
+		else
+			maparray[0] = -1;
+
+		if(dockStatusState)
+		       {
+
+		       //Also notice how this control is designated control
+		       //one. ITS INDEX IN THE PSWP ARRAY MAY OR MAY NOT BE ONE.
+		       //This therefore allows you to refer back and get the
+		       //proper PSWP index for controls whose position depends
+		       //on the placement of other controls. Very useful for
+		       //when you have 30 controls and they all depend on each
+		       //others placement. This is the case in my Spectra 4.3
+		       //application.
+		       maparray[1] = itemindex;
+
+		       // Fill in values for the statusbar
+		       pSWP[items[maparray[1]]].fl = SWP_SIZE | SWP_MOVE;      // SWP_SIZE style flag
+		       pSWP[items[maparray[1]]].cy = pSWP[usMenu].cy;          // Heigth menu hoogte
+		       pSWP[items[maparray[1]]].cx = pSWP[usMenu].cx ;         // width is menu width
+		       pSWP[items[maparray[1]]].x = pSWP[usClient].x ;         // XPOS in FRAME
+		       pSWP[items[maparray[1]]].y = pSWP[usClient].y ;         // YPOS in FRAME               pSWP[usStatus].hwndInsertBehind = HWND_TOP ;  // On which window (ONTOP)
+		       pSWP[items[maparray[1]]].hwnd = hwndStatus;             // Window handle
+
+		       // adjust client window size for 2nd control
+		       // If not, the client window will be placed over the statusbar
+		       pSWP[usClient].cy= pSWP[usClient].cy - pSWP[items[maparray[1]]].cy ;
+		       pSWP[usClient].y = pSWP[items[maparray[1]]].y  + pSWP[items[maparray[1]]].cy ;
+		       }
+		else
+			maparray[1] = -1;
+
+	       // return total count of frame controls
+	       //return( MRFROMSHORT(itemCount+2));
+	       //Old code below: When you dock controls you do not know
+		//ahead of time what the number to add is. You must calculate
+		//this on the fly based on whether or not the control is to
+		//be floated or docked
+		if(dockMenuState)
+			itemCount++;
+		if(dockStatusState)
+			itemCount++;
+		return (MRESULT) itemCount;	       }
+
+	  default:
+	       return oldFrameProc(hwnd,msg,mp1,mp2);
+          }
+     }
+
+
+INT ToggleDockState(HWND mainFrame, HWND *floatFrame, HWND control, WinParms* controlParms, BOOL dockView)
+{
+	ULONG flags = FCF_TITLEBAR |FCF_SYSMENU |FCF_SIZEBORDER |FCF_MINMAX;
+	ULONG moveflags = SWP_SIZE | SWP_MOVE | SWP_ACTIVATE | SWP_SHOW;
+	POINTL ptl;
+	RECTL rect;
+	static PFNWP frameproc;
+
+
+//Debug lines of code to view truth table values
+//	char buf[50];
+//	sprintf(buf, "dockState = %d dockView = %d", *(controlParms->dockState), dockView);
+//	WinMessageBox(HWND_DESKTOP, mainFrame, buf, "", 0, MB_OK);
+
+	if(!dockView)
+		{
+
+		//If we are not just hiding the window the dock  state changes
+		*(controlParms->dockState) = *(controlParms->dockState) ? 0:1;
+		}
+
+	//place floating frame wrt main frame origin
+	ptl.x = ptl.y = 0;
+
+	//Convert to desktop coordinates
+	WinMapWindowPoints(mainFrame, HWND_DESKTOP, &ptl, 1);
+
+	//Get size of control i.e. we make the floating frame this size
+	WinQueryWindowRect(control, &rect);
+
+	//Make sure the floating frame will be visible on the desktop
+	ptl.x -= rect.xRight;
+	if (ptl.x < 0)
+		ptl.x = 0;
+	if(ptl.y < 0)
+		ptl.y = 0;
+	if(!*(controlParms->dockState))
+		{
+		if(dockView)
+			{
+			if(*floatFrame)
+				{
+
+				//Minimize or show the floating frame based on its current state
+				if(WinIsWindowShowing(control))
+					{
+					
+					 // Hides floating frame
+					WinShowWindow(*floatFrame, FALSE);
+					}
+				else
+					{
+
+					 // Shows and activates floating frame
+					WinShowWindow(*floatFrame, TRUE);
+					}
+
+				//Check the View Menu item
+				WinCheckMenuItem(controlParms->menu, controlParms->item, WinIsWindowShowing(control));
+				return *(controlParms->dockState);
+				}
+			else
+				{
+
+				//From the minimized state to the docked state
+				//The docking state changes 
+				*(controlParms->dockState) = 1;
+
+				//Set parent of control to our main frame window
+				WinSetParent(control, mainFrame, TRUE);
+
+				//Show the control we want to dock
+				WinShowWindow(control, TRUE);
+
+				//Check the View Menu item
+				WinCheckMenuItem(controlParms->menu, controlParms->item, WinIsWindowShowing(control));
+	
+				//Update our frame to format our control
+				WinSendMsg(mainFrame, WM_UPDATEFRAME, 0, (MPARAM) 0);
+				return *(controlParms->dockState);
+				}
+			}
+
+		//From the Docked State to the Floating State
+		//WinShowWindow(control, FALSE);
+		*floatFrame = WinCreateStdWindow(
+			HWND_DESKTOP,
+			WS_CLIPSIBLINGS,
+			&flags,              
+			szFloatClient,
+			"",
+			0,
+			(HMODULE)0L,            
+			0,
+			0);
+
+		//Set Control's parent to the floating window
+		WinSetParent(control,
+			*floatFrame,
+			TRUE);
+
+		//Subclass the floating frame i.e. so we can format it
+		frameproc = WinSubclassWindow(*floatFrame,NewDocProc);
+		controlParms->oldFrameProc = frameproc;
+		controlParms->control = control;
+		WinSetWindowPtr(*floatFrame,
+			QWL_USER,
+			(PVOID) controlParms);
+
+		 // Shows and activates floating frame
+		 rect.yTop = rect.yTop + WinQuerySysValue(HWND_DESKTOP, SV_CYTITLEBAR) + WinQuerySysValue(HWND_DESKTOP, SV_CYSIZEBORDER);;
+		WinSetWindowPos(*floatFrame,
+			HWND_TOP,
+			ptl.x, ptl.y,
+			rect.xRight, rect.yTop,
+			moveflags);
+
+		//Reformat main frame window without the floating control
+		WinSendMsg(mainFrame,
+			WM_UPDATEFRAME,
+			(MPARAM) 0,
+			(MPARAM) 0);
+
+		//Our Control is in view so check the view MENUITEM
+		WinCheckMenuItem(controlParms->menu, controlParms->item,
+			WinIsWindowShowing(control));
+		return *(controlParms->dockState);
+		}
+	else
+		{
+		if(dockView)
+			{
+
+			//From the Docked State to the Minimized Window State
+			//Dock State changes
+			*(controlParms->dockState) = 0;
+
+			//Hide the control we want to be invisible
+			WinShowWindow(control, FALSE);
+			//Set parent of control to our minimized float frame
+			WinSetParent(control,
+			HWND_DESKTOP,
+			TRUE);
+
+			//Check our menu item
+			WinCheckMenuItem(controlParms->menu, controlParms->item,
+				WinIsWindowShowing(control));
+			WinSendMsg(mainFrame,
+				WM_UPDATEFRAME,
+				(MPARAM) 0,
+				(MPARAM) 0);
+			return *(controlParms->dockState);
+			}
+		else
+			{
+
+			//From Floating State to Docking State
+			WinSetParent(control,
+				mainFrame,
+				TRUE);
+
+			//Update our main frame Window to include our docked control
+			WinSendMsg(mainFrame,
+				WM_UPDATEFRAME,
+				(MPARAM) 0,
+				(MPARAM) 0);
+
+			//Destroy Floating Window 
+			//NOTE: Be sure parent has been changed WinDestroy
+			//Window also destroys all children
+			WinDestroyWindow(*floatFrame);
+			*floatFrame = 0;
+
+			//Uncheck MENUITEM our control in not in view
+			WinCheckMenuItem(controlParms->menu,
+				controlParms->item,
+				WinIsWindowShowing(control));
+			return *(controlParms->dockState);
+			}
+		}
+}
+
+MRESULT EXPENTRY NewDocProc(HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2)
+{
+	WinParms*   hold;
+	PFNWP oldFrameProc;
+
+	hold = (WinParms*) WinQueryWindowPtr(hwnd, QWL_USER);
+	oldFrameProc = hold->oldFrameProc;
+
+	switch (msg)
+		{
+		case WM_QUERYFRAMECTLCOUNT:
+			{
+			USHORT   itemCount;
+
+			//count frame controls
+			itemCount = SHORT1FROMMR(oldFrameProc(hwnd,msg,mp1,mp2));
+
+			//add 'x' for new controls
+			if (!hold->isMenu)
+				itemCount++;
+			return (MRESULT) (itemCount);
+			}
+		break;
+
+		case WM_FORMATFRAME :
+			{
+			USHORT maparray[2], items[2], itemindex;
+			USHORT itemCount = 0, usClient = 0;
+			PSWP pSWP;
+
+			//Set up pointer to window structures
+			pSWP = (PSWP)PVOIDFROMMP(mp1);
+
+			//Get the number of controls OS/2 does for us
+			itemCount = SHORT1FROMMR(oldFrameProc(hwnd, msg, mp1, mp2));
+
+			//Get ID of Client
+			while (pSWP[usClient].hwnd != WinWindowFromID(hwnd, FID_CLIENT))
+				++usClient;
+			if(hold->isMenu)
+				{
+
+				}			else
+				{
+				pSWP[itemCount].hwnd = hold->control;
+				pSWP[itemCount].fl = pSWP[usClient].fl;
+				pSWP[itemCount].hwndInsertBehind = HWND_BOTTOM;
+				pSWP[itemCount].x = pSWP[usClient].x;
+				pSWP[itemCount].y = pSWP[usClient].y;
+				pSWP[itemCount].cy = pSWP[usClient].cy;
+				pSWP[itemCount].cx = pSWP[usClient].cx;
+
+				pSWP[usClient].x = 0;
+				pSWP[usClient].cx = 0;
+				pSWP[usClient].y = 0;
+				pSWP[usClient].cy = 0;
+				itemCount++;
+				}
+
+			//Return Item count + 'x' for new controls
+			return MRESULT (itemCount);
+			}
+		break;
+		default:
+		break;
+		}
+
+	return oldFrameProc(hwnd,msg,mp1,mp2);
+}
+
+MRESULT EXPENTRY NewDocClientProc(HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2)
+{
+	switch(msg)
+		{
+		case WM_CLOSE:
+			{
+			return (MRESULT) FALSE;
+			}
+		break;
+		case WM_ERASEBACKGROUND:
+			{
+			}
+		break;
+		default:
+		break;
+		}
+	return WinDefWindowProc(hwnd, msg, mp1, mp2);
+}
